@@ -343,15 +343,14 @@ func (n *LoopbackNode) Open(ctx context.Context, flags uint32) (fh FileHandle, f
 	return lf, 0, 0
 }
 
-var _ = (NodeOpendirer)((*LoopbackNode)(nil))
+var _ = (NodeOpendirHandler)((*LoopbackNode)(nil))
 
-func (n *LoopbackNode) Opendir(ctx context.Context) syscall.Errno {
-	fd, err := syscall.Open(n.path(), syscall.O_DIRECTORY, 0755)
-	if err != nil {
-		return ToErrno(err)
+func (n *LoopbackNode) OpendirHandle(ctx context.Context, flags uint32) (FileHandle, uint32, syscall.Errno) {
+	ds, errno := NewLoopbackDirStream(n.path())
+	if errno != 0 {
+		return nil, 0, errno
 	}
-	syscall.Close(fd)
-	return OK
+	return ds, 0, errno
 }
 
 var _ = (NodeReaddirer)((*LoopbackNode)(nil))
@@ -364,7 +363,9 @@ var _ = (NodeGetattrer)((*LoopbackNode)(nil))
 
 func (n *LoopbackNode) Getattr(ctx context.Context, f FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if f != nil {
-		return f.(FileGetattrer).Getattr(ctx, out)
+		if fga, ok := f.(FileGetattrer); ok {
+			return fga.Getattr(ctx, out)
+		}
 	}
 
 	p := n.path()

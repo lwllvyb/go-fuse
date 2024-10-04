@@ -5,7 +5,7 @@
 package nodefs
 
 import (
-	"io/ioutil"
+	"os"
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -59,11 +59,7 @@ func (n *nodeReadNode) Lookup(out *fuse.Attr, name string, context *fuse.Context
 }
 
 func TestNoOpen(t *testing.T) {
-	dir, err := ioutil.TempDir("", "nodefs")
-	if err != nil {
-		t.Fatalf("TempDir: %v", err)
-	}
-
+	dir := t.TempDir()
 	root := newNodeReadNode(true, true, nil)
 	root.noOpen = true
 
@@ -71,7 +67,7 @@ func TestNoOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MountRoot: %v", err)
 	}
-	defer s.Unmount()
+	t.Cleanup(func() { s.Unmount() })
 	go s.Serve()
 	if err := s.WaitMount(); err != nil {
 		t.Fatal("WaitMount", err)
@@ -81,7 +77,7 @@ func TestNoOpen(t *testing.T) {
 		t.Skip("Kernel does not support open-less read/writes. Skipping test.")
 	}
 
-	content, err := ioutil.ReadFile(dir + "/file")
+	content, err := os.ReadFile(dir + "/file")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -90,7 +86,7 @@ func TestNoOpen(t *testing.T) {
 		t.Fatalf("got %q, want %q", content, want)
 	}
 
-	content, err = ioutil.ReadFile(dir + "/file2")
+	content, err = os.ReadFile(dir + "/file2")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -102,10 +98,7 @@ func TestNoOpen(t *testing.T) {
 }
 
 func TestNodeRead(t *testing.T) {
-	dir, err := ioutil.TempDir("", "nodefs")
-	if err != nil {
-		t.Fatalf("TempDir: %v", err)
-	}
+	dir := t.TempDir()
 
 	root := newNodeReadNode(false, true, nil)
 	opts := NewOptions()
@@ -119,7 +112,7 @@ func TestNodeRead(t *testing.T) {
 	if err := s.WaitMount(); err != nil {
 		t.Fatal("WaitMount", err)
 	}
-	content, err := ioutil.ReadFile(dir + "/file")
+	content, err := os.ReadFile(dir + "/file")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}

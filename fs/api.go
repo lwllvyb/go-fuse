@@ -19,7 +19,7 @@
 //	// Node types should implement some file system operations, eg. Lookup
 //	var _ = (fs.NodeLookuper)((*myNode)(nil))
 //
-//	func (n *myNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*Inode, syscall.Errno) {
+//	func (n *myNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 //		ops := myNode{}
 //		out.Mode = 0755
 //		out.Size = 42
@@ -221,7 +221,7 @@
 //
 // Instead of discovering the FS tree on the fly, you can construct
 // the entire tree from an OnAdd method. Then, that in-memory tree
-// structure becomes the source of truth. This means you Go-FUSE must
+// structure becomes the source of truth. This means that Go-FUSE must
 // remember Inodes even if the kernel is no longer interested in
 // them. This is done by instantiating "persistent" inodes from the
 // OnAdd method of the root node.  See the ZipFS example for a
@@ -382,6 +382,8 @@ type NodeFlusher interface {
 // The default implementation forwards to the FileHandle.
 type NodeReleaser interface {
 	Release(ctx context.Context, f FileHandle) syscall.Errno
+
+	// TODO - what about ReleaseIn?
 }
 
 // Allocate preallocates space for future writes, so they will
@@ -396,6 +398,8 @@ type NodeCopyFileRanger interface {
 	CopyFileRange(ctx context.Context, fhIn FileHandle,
 		offIn uint64, out *Inode, fhOut FileHandle, offOut uint64,
 		len uint64, flags uint64) (uint32, syscall.Errno)
+
+	// Ugh. should have been called Copyfilerange
 }
 
 // Lseek is used to implement holes: it should return the
@@ -424,6 +428,17 @@ type NodeSetlker interface {
 // for more information.  If not defined, returns ENOTSUP
 type NodeSetlkwer interface {
 	Setlkw(ctx context.Context, f FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno
+}
+
+// OnForget is called when the node becomes unreachable. This can
+// happen because the kernel issues a FORGET request,
+// ForgetPersistent() is called on the inode, or the last child of the
+// directory disappears. Implementers must make sure that the inode
+// cannot be revived concurrently by a LOOKUP call. Modifying the tree
+// using RmChild and AddChild can also trigger a spurious OnForget;
+// use MvChild instead.
+type NodeOnForgetter interface {
+	OnForget()
 }
 
 // DirStream lists directory entries.
@@ -637,6 +652,36 @@ type FileSetattrer interface {
 // See NodeAllocater.
 type FileAllocater interface {
 	Allocate(ctx context.Context, off uint64, size uint64, mode uint32) syscall.Errno
+}
+
+// Opens a directory. This supersedes NodeOpendirer, allowing to pass
+// back flags (eg. FOPEN_CACHE_DIR).
+type NodeOpendirHandler interface {
+	OpendirHandle(ctx context.Context, flags uint32) (fh FileHandle, fuseFlags uint32, errno syscall.Errno)
+}
+
+// FileReaddirenter is a directory that supports reading.
+type FileReaddirenter interface {
+	// Read a single directory entry.
+	Readdirent(ctx context.Context) (*fuse.DirEntry, syscall.Errno)
+}
+
+// FileFsyncer is a directory that supports fsyncdir.
+type FileFsyncdirer interface {
+	Fsyncdir(ctx context.Context, flags uint32) syscall.Errno
+}
+
+// FileSeekdirer is directory that supports seeking. `off` is an
+// opaque uint64 value, where only the value 0 is reserved for the
+// start of the stream. (See https://lwn.net/Articles/544520/ for
+// background).
+type FileSeekdirer interface {
+	Seekdir(ctx context.Context, off uint64) syscall.Errno
+}
+
+// FileReleasedirer is a directory that supports a cleanup operation.
+type FileReleasedirer interface {
+	Releasedir(ctx context.Context, releaseFlags uint32)
 }
 
 // Options sets options for the entire filesystem

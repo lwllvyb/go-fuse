@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"reflect"
@@ -166,11 +165,11 @@ func TestDataFile(t *testing.T) {
 	}
 
 	replace := []byte("replaced!")
-	if err := ioutil.WriteFile(mntDir+"/file", replace, 0644); err != nil {
+	if err := os.WriteFile(mntDir+"/file", replace, 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if gotBytes, err := ioutil.ReadFile(mntDir + "/file"); err != nil {
+	if gotBytes, err := os.ReadFile(mntDir + "/file"); err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	} else if bytes.Compare(replace, gotBytes) != 0 {
 		t.Fatalf("read: got %q want %q", gotBytes, replace)
@@ -198,7 +197,7 @@ func TestDataFileLargeRead(t *testing.T) {
 			n.AddChild("file", ch, false)
 		},
 	})
-	got, err := ioutil.ReadFile(mntDir + "/file")
+	got, err := os.ReadFile(mntDir + "/file")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -237,9 +236,23 @@ func TestDataSymlink(t *testing.T) {
 	}
 }
 
+func readDirStream(st DirStream) (result []fuse.DirEntry, errno syscall.Errno) {
+	for st.HasNext() {
+		var de fuse.DirEntry
+		de, errno = st.Next()
+		if errno != 0 {
+			return
+		}
+
+		result = append(result, de)
+	}
+	return
+}
+
 func TestReaddirplusParallel(t *testing.T) {
 	root := &Inode{}
 	N := 100
+	P := 100
 	oneSec := time.Second
 	names := map[string]int64{}
 	mntDir, _ := testMount(t, root, &Options{
@@ -264,40 +277,75 @@ func TestReaddirplusParallel(t *testing.T) {
 		},
 	})
 
-	read := func() (map[string]int64, error) {
-		es, err := os.ReadDir(mntDir)
-		if err != nil {
-			return nil, err
+	read := func() ([]fuse.DirEntry, error) {
+		ds, errno := NewLoopbackDirStream(mntDir)
+		if errno != 0 {
+			return nil, errno
 		}
-
-		r := map[string]int64{}
-		for _, e := range es {
-			inf, err := e.Info()
-			if err != nil {
-				return nil, err
-			}
-			r[e.Name()] = inf.Size()
+		defer ds.Close()
+		es, errno := readDirStream(ds)
+		if errno != 0 {
+			return nil, errno
 		}
-		return r, nil
+		return es, nil
 	}
 
+	want, err := read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != N {
+		t.Fatalf("read back %d entries, want %d", len(want), N)
+	}
 	var wg sync.WaitGroup
-	for i := 0; i < N; i++ {
+	for i := 0; i < P; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := read()
+			got, err := read()
 			if err != nil {
 				t.Errorf("readdir: %v", err)
-			}
-			if got, want := len(res), len(names); got != want {
-				t.Errorf("got %d want %d", got, want)
 				return
 			}
-			if !reflect.DeepEqual(res, names) {
-				t.Errorf("maps have different content")
+			if len(got) != len(want) {
+				t.Errorf("got len %d, want %d", len(got), len(want))
+				return
+			}
+			for i := 0; i < len(got) && i < len(want); i++ {
+				if !reflect.DeepEqual(got[i], want[i]) {
+					t.Errorf("entry %d: got %v, want %v", i, got[i], want[i])
+					return
+				}
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+func TestReaddirplusConsistency(t *testing.T) {
+	root := &Inode{}
+	N := 100
+	oneSec := time.Second
+	mnt, _ := testMount(t, root, &Options{
+		FirstAutomaticIno: 1,
+		EntryTimeout:      &oneSec,
+		AttrTimeout:       &oneSec,
+		OnAdd: func(ctx context.Context) {
+			n := root.EmbeddedInode()
+
+			for i := 0; i < N; i++ {
+				ch := n.NewPersistentInode(
+					ctx,
+					&MemRegularFile{
+						Data: bytes.Repeat([]byte{'x'}, i),
+					},
+					StableAttr{})
+
+				name := fmt.Sprintf("file%04d", i)
+				n.AddChild(name, ch, false)
+			}
+		},
+	})
+
+	posixtest.ReadDirConsistency(t, mnt)
 }

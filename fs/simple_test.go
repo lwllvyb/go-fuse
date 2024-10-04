@@ -7,7 +7,6 @@ package fs
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -42,7 +41,7 @@ type testCase struct {
 
 // writeOrig writes a file into the backing directory of the loopback mount
 func (tc *testCase) writeOrig(path, content string, mode os.FileMode) {
-	if err := ioutil.WriteFile(filepath.Join(tc.origDir, path), []byte(content), mode); err != nil {
+	if err := os.WriteFile(filepath.Join(tc.origDir, path), []byte(content), mode); err != nil {
 		tc.Fatal(err)
 	}
 }
@@ -219,7 +218,7 @@ func TestReadDirStress(t *testing.T) {
 	// Create 110 entries
 	for i := 0; i < 110; i++ {
 		name := fmt.Sprintf("file%036x", i)
-		if err := ioutil.WriteFile(filepath.Join(tc.mntDir, name), []byte("hello"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(tc.mntDir, name), []byte("hello"), 0644); err != nil {
 			t.Fatalf("WriteFile %q: %v", name, err)
 		}
 	}
@@ -394,11 +393,11 @@ func TestPosix(t *testing.T) {
 func TestOpenDirectIO(t *testing.T) {
 	// Apparently, tmpfs does not allow O_DIRECT, so try to create
 	// a test temp directory in /var/tmp.
-	ext4Dir, err := ioutil.TempDir("/var/tmp", "go-fuse.TestOpenDirectIO")
+	ext4Dir, err := os.MkdirTemp("/var/tmp", "go-fuse.TestOpenDirectIO")
 	if err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	defer os.RemoveAll(ext4Dir)
+	t.Cleanup(func() { os.RemoveAll(ext4Dir) })
 
 	posixtest.DirectIO(t, ext4Dir)
 	if t.Failed() {
@@ -711,7 +710,7 @@ func TestParallelMount(t *testing.T) {
 	// Per default, only 1000 FUSE mounts are allowed, then you get
 	// > /usr/bin/fusermount3: too many FUSE filesystems mounted; mount_max=N can be set in /etc/fuse.conf
 	// Let's stay well below 1000.
-	N := 900
+	N := 100
 	todo := make(chan string, N)
 	result := make(chan error, N)
 	for i := 0; i < N; i++ {

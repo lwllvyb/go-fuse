@@ -5,7 +5,6 @@
 package nodefs
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
@@ -16,11 +15,8 @@ import (
 
 const testTtl = 100 * time.Millisecond
 
-func setupMemNodeTest(t *testing.T) (wd string, root Node, clean func()) {
-	tmp, err := ioutil.TempDir("", "go-fuse-memnode_test")
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
+func setupMemNodeTest(t *testing.T) (wd string, root Node) {
+	tmp := t.TempDir()
 	back := tmp + "/backing"
 	os.Mkdir(back, 0700)
 	root = NewMemNodeFSRoot(back)
@@ -46,33 +42,32 @@ func setupMemNodeTest(t *testing.T) (wd string, root Node, clean func()) {
 	if err := state.WaitMount(); err != nil {
 		t.Fatal("WaitMount", err)
 	}
-	return mnt, root, func() {
+	t.Cleanup(func() {
 		state.Unmount()
-		os.RemoveAll(tmp)
-	}
+	})
+
+	return mnt, root
 }
 
 func TestMemNodeFsWrite(t *testing.T) {
-	wd, _, clean := setupMemNodeTest(t)
-	defer clean()
+	wd, _ := setupMemNodeTest(t)
 	want := "hello"
 
-	err := ioutil.WriteFile(wd+"/test", []byte(want), 0644)
+	err := os.WriteFile(wd+"/test", []byte(want), 0644)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	content, err := ioutil.ReadFile(wd + "/test")
+	content, err := os.ReadFile(wd + "/test")
 	if string(content) != want {
 		t.Fatalf("content mismatch: got %q, want %q", content, want)
 	}
 }
 
 func TestMemNodeFsBasic(t *testing.T) {
-	wd, _, clean := setupMemNodeTest(t)
-	defer clean()
+	wd, _ := setupMemNodeTest(t)
 
-	err := ioutil.WriteFile(wd+"/test", []byte{42}, 0644)
+	err := os.WriteFile(wd+"/test", []byte{42}, 0644)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
@@ -85,15 +80,14 @@ func TestMemNodeFsBasic(t *testing.T) {
 		t.Errorf("Size after write incorrect: got %d want 1", fi.Size())
 	}
 
-	entries, err := ioutil.ReadDir(wd)
+	entries, err := os.ReadDir(wd)
 	if len(entries) != 1 || entries[0].Name() != "test" {
 		t.Fatalf("Readdir got %v, expected 1 file named 'test'", entries)
 	}
 }
 
 func TestMemNodeSetattr(t *testing.T) {
-	wd, _, clean := setupMemNodeTest(t)
-	defer clean()
+	wd, _ := setupMemNodeTest(t)
 
 	f, err := os.OpenFile(wd+"/test", os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {

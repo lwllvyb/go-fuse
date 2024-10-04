@@ -9,7 +9,6 @@ package test
 import (
 	"bytes"
 	"encoding/binary"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -82,7 +81,7 @@ func TestCacheControl(t *testing.T) {
 	assertFileRead := func(subj, dataOK string) {
 		t.Helper()
 
-		v, err := ioutil.ReadFile(dir + "/hello.txt")
+		v, err := os.ReadFile(dir + "/hello.txt")
 		if err != nil {
 			t.Fatalf("%s: file read: %s", subj, err)
 		}
@@ -262,7 +261,7 @@ func TestCacheControl(t *testing.T) {
 		for i := uint32(0); i < lbig/4; i++ {
 			err := binary.Write(buf, binary.BigEndian, i+0x01020304)
 			if err != nil {
-				panic(err) // Buffer.Write does not error
+				t.Fatal(err)
 			}
 		}
 		dataBig := buf.String()

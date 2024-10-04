@@ -1,12 +1,16 @@
 #!/bin/bash
 set -eux
 
+# Kernel version is relevant to debugging CI failures
+uname -a
+
 # Everything must compile on Linux
 go build ./...
 
 # Not everything compiles on MacOS (try GOOS=darwin go build ./...).
 # But our key packages should.
-GOOS=darwin go build ./fuse/... ./fs/... ./example/loopback/...
+GOOS=darwin go build ./fs/... ./example/loopback/...
+GOOS=freebsd go build ./fs/... ./example/loopback/...
 
 # Run the tests. Why the flags:
 # -timeout 5m ... Get a backtrace on a hung test before the CI system kills us

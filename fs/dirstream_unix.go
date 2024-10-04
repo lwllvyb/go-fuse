@@ -7,26 +7,29 @@
 package fs
 
 import (
+	"context"
 	"sync"
 	"syscall"
-	"unsafe"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sys/unix"
 )
 
 type loopbackDirStream struct {
-	buf       []byte
+	buf []byte
+
+	// Protects mutable members
+	mu sync.Mutex
+
+	// mutable
 	todo      []byte
 	todoErrno syscall.Errno
-
-	// Protects fd so we can guard against double close
-	mu sync.Mutex
-	fd int
+	fd        int
 }
 
 // NewLoopbackDirStream open a directory for reading as a DirStream
 func NewLoopbackDirStream(name string) (DirStream, syscall.Errno) {
+	// TODO: should return concrete type.
 	fd, err := syscall.Open(name, syscall.O_DIRECTORY, 0755)
 	if err != nil {
 		return nil, ToErrno(err)
@@ -36,11 +39,7 @@ func NewLoopbackDirStream(name string) (DirStream, syscall.Errno) {
 		buf: make([]byte, 4096),
 		fd:  fd,
 	}
-
-	if err := ds.load(); err != 0 {
-		ds.Close()
-		return nil, err
-	}
+	ds.load()
 	return ds, OK
 }
 
@@ -53,10 +52,50 @@ func (ds *loopbackDirStream) Close() {
 	}
 }
 
+var _ = (FileReleasedirer)((*loopbackDirStream)(nil))
+
+func (ds *loopbackDirStream) Releasedir(ctx context.Context, flags uint32) {
+	ds.Close()
+}
+
+var _ = (FileSeekdirer)((*loopbackDirStream)(nil))
+
+func (ds *loopbackDirStream) Seekdir(ctx context.Context, off uint64) syscall.Errno {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	_, errno := unix.Seek(ds.fd, int64(off), unix.SEEK_SET)
+	if errno != nil {
+		return ToErrno(errno)
+	}
+
+	ds.todo = nil
+	ds.todoErrno = 0
+	ds.load()
+	return 0
+}
+
+var _ = (FileFsyncdirer)((*loopbackDirStream)(nil))
+
+func (ds *loopbackDirStream) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	return ToErrno(syscall.Fsync(ds.fd))
+}
+
 func (ds *loopbackDirStream) HasNext() bool {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	return len(ds.todo) > 0 || ds.todoErrno != 0
+}
+
+var _ = (FileReaddirenter)((*loopbackDirStream)(nil))
+
+func (ds *loopbackDirStream) Readdirent(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
+	if !ds.HasNext() {
+		return nil, 0
+	}
+	de, errno := ds.Next()
+	return &de, errno
 }
 
 func (ds *loopbackDirStream) Next() (fuse.DirEntry, syscall.Errno) {
@@ -66,35 +105,18 @@ func (ds *loopbackDirStream) Next() (fuse.DirEntry, syscall.Errno) {
 	if ds.todoErrno != 0 {
 		return fuse.DirEntry{}, ds.todoErrno
 	}
-
-	// We can't use syscall.Dirent here, because it declares a
-	// [256]byte name, which may run beyond the end of ds.todo.
-	// when that happens in the race detector, it causes a panic
-	// "converted pointer straddles multiple allocations"
-	de := (*dirent)(unsafe.Pointer(&ds.todo[0]))
-
-	nameBytes := ds.todo[unsafe.Offsetof(dirent{}.Name):de.Reclen]
-	ds.todo = ds.todo[de.Reclen:]
-
-	// After the loop, l contains the index of the first '\0'.
-	l := 0
-	for l = range nameBytes {
-		if nameBytes[l] == 0 {
-			break
-		}
+	var res fuse.DirEntry
+	n := res.Parse(ds.todo)
+	ds.todo = ds.todo[n:]
+	if len(ds.todo) == 0 {
+		ds.load()
 	}
-	nameBytes = nameBytes[:l]
-	result := fuse.DirEntry{
-		Ino:  de.Ino,
-		Mode: (uint32(de.Type) << 12),
-		Name: string(nameBytes),
-	}
-	return result, ds.load()
+	return res, 0
 }
 
-func (ds *loopbackDirStream) load() syscall.Errno {
+func (ds *loopbackDirStream) load() {
 	if len(ds.todo) > 0 {
-		return OK
+		return
 	}
 
 	n, err := unix.Getdents(ds.fd, ds.buf)
@@ -103,5 +125,4 @@ func (ds *loopbackDirStream) load() syscall.Errno {
 	}
 	ds.todo = ds.buf[:n]
 	ds.todoErrno = ToErrno(err)
-	return OK
 }

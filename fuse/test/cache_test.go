@@ -6,8 +6,6 @@ package test
 
 import (
 	"bytes"
-	"fmt"
-	"io/ioutil"
 	"os"
 	"runtime"
 	"sync"
@@ -79,14 +77,14 @@ func TestFopenKeepCache(t *testing.T) {
 
 	// x{read,write}File reads/writes file@path and fail on error
 	xreadFile := func(path string) string {
-		data, err := ioutil.ReadFile(path)
+		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return string(data)
 	}
 	xwriteFile := func(path, data string) {
-		if err := ioutil.WriteFile(path, []byte(data), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(data), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -111,7 +109,7 @@ func TestFopenKeepCache(t *testing.T) {
 	before := "before"
 	after := "afterX"
 	if len(before) != len(after) {
-		panic("len(before) != len(after)")
+		t.Fatal("len(before) != len(after)")
 	}
 
 	xwriteFile(wd+"/orig/file.txt", before)
@@ -127,7 +125,7 @@ func TestFopenKeepCache(t *testing.T) {
 	xwriteFile(wd+"/orig/file.txt", after)
 	mtimeAfter := xstat(wd + "/orig/file.txt").ModTime()
 	if δ := mtimeAfter.Sub(mtimeBefore); δ == 0 {
-		panic(fmt.Sprintf("mtime(orig/before) == mtime(orig/after)"))
+		t.Fatal("mtime(orig/before) == mtime(orig/after)")
 	}
 
 	// sleep enough time for file attributes to expire; restat the file after.
@@ -244,7 +242,7 @@ func TestGetAttrRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			fn := dir + "/mnt/file"
-			err := ioutil.WriteFile(fn, []byte{42}, 0644)
+			err := os.WriteFile(fn, []byte{42}, 0644)
 			if err != nil {
 				statErr = err
 				return

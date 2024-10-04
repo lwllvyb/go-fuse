@@ -67,6 +67,7 @@ type Server struct {
 	reqReaders     int
 	reqInflight    []*request
 	kernelSettings InitIn
+	connectionDead bool
 
 	// in-flight notify-retrieve queries
 	retrieveMu   sync.Mutex
@@ -77,8 +78,6 @@ type Server struct {
 	canSplice    bool
 	loops        sync.WaitGroup
 	serving      bool // for preventing duplicate Serve() calls
-
-	ready chan error
 
 	// for implementing single threaded processing.
 	requestProcessingMu sync.Mutex
@@ -201,7 +200,6 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		maxReaders:   maxReaders,
 		retrieveTab:  make(map[uint64]*retrieveCacheRequest),
 		singleReader: useSingleReader,
-		ready:        make(chan error, 1),
 	}
 	ms.reqPool.New = func() interface{} {
 		return &request{
@@ -225,7 +223,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		}
 		mountPoint = filepath.Clean(filepath.Join(cwd, mountPoint))
 	}
-	fd, err := mount(mountPoint, &o, ms.ready)
+	fd, err := mount(mountPoint, &o)
 	if err != nil {
 		return nil, err
 	}
@@ -517,7 +515,10 @@ exit:
 		case ENOENT:
 			continue
 		case ENODEV:
-			// unmount
+			// Mount was killed. The obvious place to
+			// cancel outstanding requests is at the end
+			// of Serve, but that reader might be blocked.
+			ms.cancelAll()
 			if ms.opts.Debug {
 				ms.opts.Logger.Printf("received ENODEV (unmount request), thread exiting")
 			}
@@ -533,6 +534,19 @@ exit:
 			ms.handleRequest(req)
 		}
 	}
+}
+
+func (ms *Server) cancelAll() {
+	ms.reqMu.Lock()
+	defer ms.reqMu.Unlock()
+	ms.connectionDead = true
+	for _, req := range ms.reqInflight {
+		if !req.interrupted {
+			close(req.cancel)
+			req.interrupted = true
+		}
+	}
+	// Leave ms.reqInflight alone, or returnRequest will barf.
 }
 
 func (ms *Server) handleRequest(req *request) Status {
@@ -617,7 +631,14 @@ func (ms *Server) write(req *request) Status {
 			return OK
 		}
 	}
-
+	if req.status == EINTR {
+		ms.reqMu.Lock()
+		dead := ms.connectionDead
+		ms.reqMu.Unlock()
+		if dead {
+			return OK
+		}
+	}
 	header := req.serializeHeader(req.flatDataSize())
 	if ms.opts.Debug {
 		ms.opts.Logger.Println(req.OutputDebug())
@@ -956,10 +977,6 @@ func (in *InitIn) supportsRenameSwap() bool {
 // avoid racing between accessing the (empty or not yet mounted)
 // mountpoint, and the OS trying to setup the user-space mount.
 func (ms *Server) WaitMount() error {
-	err := <-ms.ready
-	if err != nil {
-		return err
-	}
 	if parseFuseFd(ms.mountPoint) >= 0 {
 		// Magic `/dev/fd/N` mountpoint. We don't know the real mountpoint, so
 		// we cannot run the poll hack.

@@ -2,11 +2,11 @@ package fuse
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"syscall"
 	"testing"
 
+	"github.com/hanwen/go-fuse/v2/internal/testutil"
 	"github.com/moby/sys/mountinfo"
 )
 
@@ -16,11 +16,7 @@ import (
 // In this test, we simulate a privileged parent by using the `fusermount` suid
 // helper.
 func TestMountDevFd(t *testing.T) {
-	realMountPoint, err := ioutil.TempDir("", t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer syscall.Rmdir(realMountPoint)
+	realMountPoint := t.TempDir()
 
 	// Call the fusermount suid helper to obtain the file descriptor in place
 	// of a privileged parent.
@@ -35,7 +31,7 @@ func TestMountDevFd(t *testing.T) {
 	// See if we can feed fdMountPoint to NewServer
 	fs := NewDefaultRawFileSystem()
 	opts := MountOptions{
-		Debug: true,
+		Debug: testutil.VerboseTest(),
 	}
 	srv, err := NewServer(fs, fdMountPoint, &opts)
 	if err != nil {
@@ -86,10 +82,7 @@ func TestMountMaxWrite(t *testing.T) {
 	for _, o := range opts {
 		name := fmt.Sprintf("MaxWrite%d", o.MaxWrite)
 		t.Run(name, func(t *testing.T) {
-			mnt, err := ioutil.TempDir("", name)
-			if err != nil {
-				t.Fatal(err)
-			}
+			mnt := t.TempDir()
 			fs := NewDefaultRawFileSystem()
 			srv, err := NewServer(fs, mnt, &o)
 			if err != nil {
@@ -107,10 +100,7 @@ func TestMountMaxWrite(t *testing.T) {
 // The mount options are a comma-separated string like this:
 // rw,nosuid,nodev,relatime,user_id=1026,group_id=1026
 func mountCheckOptions(t *testing.T, opts MountOptions) (info mountinfo.Info) {
-	mnt, err := ioutil.TempDir("", t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	mnt := t.TempDir()
 	fs := NewDefaultRawFileSystem()
 	srv, err := NewServer(fs, mnt, &opts)
 	if err != nil {
@@ -152,17 +142,18 @@ func mountCheckOptions(t *testing.T, opts MountOptions) (info mountinfo.Info) {
 // same effective mount options in /proc/self/mounts
 func TestDirectMount(t *testing.T) {
 	optsTable := []MountOptions{
-		{Debug: true},
-		{Debug: true, AllowOther: true},
-		{Debug: true, MaxWrite: 9999},
-		{Debug: true, FsName: "aaa"},
-		{Debug: true, Name: "bbb"},
-		{Debug: true, FsName: "ccc", Name: "ddd"},
-		{Debug: true, FsName: "a,b"},
-		{Debug: true, FsName: `a\b`},
-		{Debug: true, FsName: `a\,b`},
+		{},
+		{AllowOther: true},
+		{MaxWrite: 9999},
+		{FsName: "aaa"},
+		{Name: "bbb"},
+		{FsName: "ccc", Name: "ddd"},
+		{FsName: "a,b"},
+		{FsName: `a\b`},
+		{FsName: `a\,b`},
 	}
 	for _, opts := range optsTable {
+		opts.Debug = testutil.VerboseTest()
 		// Without DirectMount - i.e. using fusermount
 		o1 := mountCheckOptions(t, opts)
 		// With DirectMount

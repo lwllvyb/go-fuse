@@ -33,10 +33,12 @@ type fileEntry struct {
 	mu sync.Mutex
 
 	// Directory
-	dirStream     DirStream
 	hasOverflow   bool
 	overflow      fuse.DirEntry
 	overflowErrno syscall.Errno
+
+	// Store the last read, in case readdir was interrupted.
+	lastRead []fuse.DirEntry
 
 	// dirOffset is the current location in the directory (see `telldir(3)`).
 	// The value is equivalent to `d_off` (see `getdents(2)`) of the last
@@ -495,9 +497,9 @@ func (b *rawBridge) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 
 func (b *rawBridge) Forget(nodeid, nlookup uint64) {
 	n, _ := b.inode(nodeid, 0)
-	forgotten, _ := n.removeRef(nlookup, false)
+	hasLookups, _, _ := n.removeRef(nlookup, false)
 
-	if forgotten {
+	if !hasLookups {
 		b.compactMemory()
 	}
 }
@@ -821,7 +823,8 @@ func (b *rawBridge) releaseBackingIDRef(n *Inode) {
 	}
 }
 
-// registerFile hands out a file handle. Must have bridge.mu
+// registerFile hands out a file handle. Must have bridge.mu. Flags are the open flags
+// (eg. syscall.O_EXCL).
 func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntry {
 	fe := &fileEntry{}
 	if len(b.freeFiles) > 0 {
@@ -834,6 +837,9 @@ func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntr
 		b.files = append(b.files, fe)
 	}
 
+	if _, ok := f.(FileReaddirenter); ok {
+		fe.lastRead = make([]fuse.DirEntry, 0, 100)
+	}
 	fe.nodeIndex = len(n.openFiles)
 	fe.file = f
 	n.openFiles = append(n.openFiles, fe.fh)
@@ -919,12 +925,9 @@ func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
 	n, f := b.releaseFileEntry(input.NodeId, input.Fh)
 	f.wg.Wait()
 
-	f.mu.Lock()
-	if f.dirStream != nil {
-		f.dirStream.Close()
-		f.dirStream = nil
+	if frd, ok := f.file.(FileReleasedirer); ok {
+		frd.Releasedir(context.Background(), input.ReleaseFlags)
 	}
-	f.mu.Unlock()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1006,194 +1009,199 @@ func (b *rawBridge) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) f
 func (b *rawBridge) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 	n, _ := b.inode(input.NodeId, 0)
 
-	if od, ok := n.ops.(NodeOpendirer); ok {
-		errno := od.Opendir(&fuse.Context{Caller: input.Caller, Cancel: cancel})
+	var fh FileHandle
+	var fuseFlags uint32
+	var errno syscall.Errno
+
+	ctx := &fuse.Context{Caller: input.Caller, Cancel: cancel}
+
+	nod, _ := n.ops.(NodeOpendirer)
+	nrd, _ := n.ops.(NodeReaddirer)
+
+	if odh, ok := n.ops.(NodeOpendirHandler); ok {
+		fh, fuseFlags, errno = odh.OpendirHandle(ctx, input.Flags)
+
 		if errno != 0 {
 			return errnoToStatus(errno)
 		}
+	} else {
+		if nod != nil {
+			errno = nod.Opendir(ctx)
+			if errno != 0 {
+				return errnoToStatus(errno)
+			}
+		}
+
+		var ctor func(context.Context) (DirStream, syscall.Errno)
+		if nrd != nil {
+			ctor = func(ctx context.Context) (DirStream, syscall.Errno) {
+				return nrd.Readdir(ctx)
+			}
+		} else {
+			ctor = func(ctx context.Context) (DirStream, syscall.Errno) {
+				return n.childrenAsDirstream(), 0
+			}
+		}
+		fh = &dirStreamAsFile{creator: ctor}
 	}
 
+	if fuseFlags&(fuse.FOPEN_CACHE_DIR|fuse.FOPEN_KEEP_CACHE) != 0 {
+		fuseFlags |= fuse.FOPEN_CACHE_DIR | fuse.FOPEN_KEEP_CACHE
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	fe := b.registerFile(n, nil, 0)
+	fe := b.registerFile(n, fh, 0)
 	out.Fh = uint64(fe.fh)
+	out.OpenFlags = fuseFlags
 	return fuse.OK
 }
 
-// setStream makes sure `f.dirStream` and associated state variables are set and
-// seeks to offset requested in `input`. Caller must hold `f.mu`.
-// The `eof` return value shows if `f.dirStream` ended before the requested
-// offset was reached.
-func (b *rawBridge) setStream(cancel <-chan struct{}, input *fuse.ReadIn, inode *Inode, f *fileEntry) (errno syscall.Errno, eof bool) {
-	// Get a new directory stream in the following cases:
-	// 1) f.dirStream == nil ............ First READDIR[PLUS] on this file handle.
-	// 2) input.Offset == 0 ............. Start reading the directory again from
-	//                                    the beginning (user called rewinddir(3) or lseek(2)).
-	// 3) input.Offset < f.nextOffset ... Seek back (user called seekdir(3) or lseek(2)).
-	if f.dirStream == nil || input.Offset == 0 || input.Offset < f.dirOffset {
-		if f.dirStream != nil {
-			f.dirStream.Close()
-			f.dirStream = nil
-		}
-		str, errno := b.getStream(&fuse.Context{Caller: input.Caller, Cancel: cancel}, inode)
-		if errno != 0 {
-			return errno, false
-		}
-
-		f.dirOffset = 0
-		f.hasOverflow = false
-		f.dirStream = str
-	}
-
-	// Seek forward?
-	for f.dirOffset < input.Offset {
-		f.hasOverflow = false
-		if !f.dirStream.HasNext() {
-			// Seek past end of directory. This is not an error, but the
-			// user will get an empty directory listing.
-			return 0, true
-		}
-		_, errno := f.dirStream.Next()
-		if errno != 0 {
-			return errno, true
-		}
-		f.dirOffset++
-	}
-
-	return 0, false
-}
-
-func (b *rawBridge) getStream(ctx context.Context, inode *Inode) (DirStream, syscall.Errno) {
-	if rd, ok := inode.ops.(NodeReaddirer); ok {
-		return rd.Readdir(ctx)
-	}
-
-	lst := inode.childrenList()
+func (n *Inode) childrenAsDirstream() DirStream {
+	lst := n.childrenList()
 	r := make([]fuse.DirEntry, 0, len(lst))
 	for _, e := range lst {
 		r = append(r, fuse.DirEntry{Mode: e.Inode.Mode(),
 			Name: e.Name,
 			Ino:  e.Inode.StableAttr().Ino})
 	}
-	return NewListDirStream(r), 0
-}
-
-func (b *rawBridge) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	n, f := b.inode(input.NodeId, input.Fh)
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	errno, eof := b.setStream(cancel, input, n, f)
-	if errno != 0 {
-		return errnoToStatus(errno)
-	} else if eof {
-		return fuse.OK
-	}
-
-	if f.hasOverflow {
-		if f.overflowErrno != 0 {
-			return errnoToStatus(f.overflowErrno)
-		}
-
-		f.hasOverflow = false
-		// always succeeds.
-		out.AddDirEntry(f.overflow)
-		f.dirOffset++
-	}
-
-	first := true
-	for f.dirStream.HasNext() {
-		e, errno := f.dirStream.Next()
-
-		if errno != 0 {
-			if first {
-				return errnoToStatus(errno)
-			} else {
-				f.hasOverflow = true
-				f.overflowErrno = errno
-				return fuse.OK
-			}
-		}
-
-		first = false
-		if !out.AddDirEntry(e) {
-			f.overflow = e
-			f.hasOverflow = true
-			return errnoToStatus(errno)
-		}
-		f.dirOffset++
-	}
-
-	return fuse.OK
+	return NewListDirStream(r)
 }
 
 func (b *rawBridge) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+	return b.readDirMaybeLookup(cancel, input, out, true)
+}
+
+func (b *rawBridge) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+	return b.readDirMaybeLookup(cancel, input, out, false)
+}
+
+func (b *rawBridge) readDirMaybeLookup(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList, lookup bool) fuse.Status {
 	n, f := b.inode(input.NodeId, input.Fh)
+
+	direnter, ok := f.file.(FileReaddirenter)
+	if !ok {
+		return fuse.OK
+	}
+	getdent := direnter.Readdirent
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	errno, eof := b.setStream(cancel, input, n, f)
-	if errno != 0 {
-		return errnoToStatus(errno)
-	} else if eof {
-		return fuse.OK
+	ctx := &fuse.Context{Caller: input.Caller, Cancel: cancel}
+	interruptedRead := false
+	if input.Offset != f.dirOffset {
+		// If the last readdir(plus) was interrupted, the
+		// kernel may consume just one entry from the readdir,
+		// and redo it.
+		for i, e := range f.lastRead {
+			if e.Off == input.Offset {
+				interruptedRead = true
+				todo := f.lastRead[i+1:]
+				todo = make([]fuse.DirEntry, len(todo))
+				copy(todo, f.lastRead[i+1:])
+				getdent = func(context.Context) (*fuse.DirEntry, syscall.Errno) {
+					if len(todo) > 0 {
+						de := &todo[0]
+						todo = todo[1:]
+						return de, 0
+					}
+					return nil, 0
+				}
+				f.dirOffset = input.Offset
+				break
+			}
+		}
 	}
 
-	ctx := &fuse.Context{Caller: input.Caller, Cancel: cancel}
-
-	first := true
-	for f.dirStream.HasNext() || f.hasOverflow {
-		var e fuse.DirEntry
-		var errno syscall.Errno
-
-		if f.hasOverflow {
-			e = f.overflow
-			errno = f.overflowErrno
+	if input.Offset != f.dirOffset {
+		if sd, ok := f.file.(FileSeekdirer); ok {
+			errno := sd.Seekdir(ctx, input.Offset)
+			if errno != 0 {
+				return errnoToStatus(errno)
+			}
+			f.dirOffset = input.Offset
+			f.overflowErrno = 0
 			f.hasOverflow = false
 		} else {
-			e, errno = f.dirStream.Next()
+			return fuse.ENOTSUP
+		}
+	}
+
+	defer func() {
+		f.dirOffset = out.Offset
+	}()
+
+	first := true
+	f.lastRead = f.lastRead[:0]
+	for {
+		var de *fuse.DirEntry
+		var errno syscall.Errno
+		if f.hasOverflow && !interruptedRead {
+			f.hasOverflow = false
+			if f.overflowErrno != 0 {
+				return errnoToStatus(f.overflowErrno)
+			}
+			de = &f.overflow
+		} else {
+			de, errno = getdent(ctx)
+			if errno != 0 {
+				if first {
+					return errnoToStatus(errno)
+				} else {
+					f.hasOverflow = true
+					f.overflowErrno = errno
+					return fuse.OK
+				}
+			}
 		}
 
-		if errno != 0 {
-			if first {
-				return errnoToStatus(errno)
-			} else {
-				f.overflowErrno = errno
+		if de == nil {
+			break
+		}
+
+		first = false
+		if de.Off == 0 {
+			// This logic is dup from fuse.DirEntryList, but we need the offset here so it is part of lastRead
+			de.Off = out.Offset + 1
+		}
+		if !lookup {
+			if !out.AddDirEntry(*de) {
+				f.overflow = *de
 				f.hasOverflow = true
 				return fuse.OK
 			}
-		}
-		first = false
 
-		entryOut := out.AddDirLookupEntry(e)
+			f.lastRead = append(f.lastRead, *de)
+			continue
+		}
+
+		entryOut := out.AddDirLookupEntry(*de)
 		if entryOut == nil {
-			f.overflow = e
+			f.overflow = *de
 			f.hasOverflow = true
 			return fuse.OK
 		}
-		f.dirOffset++
+		f.lastRead = append(f.lastRead, *de)
 
 		// Virtual entries "." and ".." should be part of the
 		// directory listing, but not part of the filesystem tree.
 		// The values in EntryOut are ignored by Linux
 		// (see fuse_direntplus_link() in linux/fs/fuse/readdir.c), so leave
 		// them at zero-value.
-		if e.Name == "." || e.Name == ".." {
+		if de.Name == "." || de.Name == ".." {
 			continue
 		}
 
-		child, errno := b.lookup(ctx, n, e.Name, entryOut)
+		child, errno := b.lookup(ctx, n, de.Name, entryOut)
 		if errno != 0 {
 			if b.options.NegativeTimeout != nil {
 				entryOut.SetEntryTimeout(*b.options.NegativeTimeout)
 			}
 		} else {
-			child, _ = b.addNewChild(n, e.Name, child, nil, 0, entryOut)
+			child, _ = b.addNewChild(n, de.Name, child, nil, 0, entryOut)
 			child.setEntryOut(entryOut)
 			b.setEntryOutTimeout(entryOut)
-			if e.Mode&syscall.S_IFMT != child.stableAttr.Mode&syscall.S_IFMT {
+			if de.Mode&syscall.S_IFMT != child.stableAttr.Mode&syscall.S_IFMT {
 				// The file type has changed behind our back. Use the new value.
 				out.FixMode(child.stableAttr.Mode)
 			}
@@ -1205,9 +1213,12 @@ func (b *rawBridge) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out 
 }
 
 func (b *rawBridge) FsyncDir(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
-	n, _ := b.inode(input.NodeId, input.Fh)
-	if fs, ok := n.ops.(NodeFsyncer); ok {
-		return errnoToStatus(fs.Fsync(&fuse.Context{Caller: input.Caller, Cancel: cancel}, nil, input.FsyncFlags))
+	n, f := b.inode(input.NodeId, input.Fh)
+	ctx := &fuse.Context{Caller: input.Caller, Cancel: cancel}
+	if fsd, ok := f.file.(FileFsyncdirer); ok {
+		return errnoToStatus(fsd.Fsyncdir(ctx, input.FsyncFlags))
+	} else if fs, ok := n.ops.(NodeFsyncer); ok {
+		return errnoToStatus(fs.Fsync(ctx, f.file, input.FsyncFlags))
 	}
 
 	return fuse.ENOTSUP
